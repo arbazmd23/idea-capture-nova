@@ -1,0 +1,6 @@
+{
+  "inferenceProfileName": "nova-micro-profile",
+  "modelSource": {
+    "copyFrom": "arn:aws:bedrock:ap-south-1::foundation-model/amazon.nova-micro-v1:0"
+  }
+}
