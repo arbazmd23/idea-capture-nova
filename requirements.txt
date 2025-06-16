@@ -6,3 +6,5 @@ pdfplumber
 boto3
 pillow
 PyMuPDF
+openai
+requests
