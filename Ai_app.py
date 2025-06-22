@@ -1,52 +1,56 @@
 import streamlit as st
-import boto3
+import anthropic
 import json
-import pdfplumber
-import tempfile
-import os
 import re
 import typing as t
-import anthropic
-from openai import OpenAI
+from pydantic import BaseModel
+import base64
 
-
-# ---------- AWS Bedrock Setup ----------
-bedrock = boto3.client("bedrock-runtime", region_name="ap-south-1")
-nova_inference_arn = (
-    "arn:aws:bedrock:ap-south-1:069717477936:inference-profile/apac.amazon.nova-pro-v1:0"
+# Set page config
+st.set_page_config(
+    page_title="Outlaw Idea Capture",
+    page_icon="🚀",
+    layout="wide"
 )
 
-# ---------- Helper: Extract PDF Text & Highlights ----------
-def extract_pdf_text(file_path: str) -> tuple[str, str]:
-    full_text, highlights = [], []
+# Response model (keeping the same structure)
+class AnalysisResponse(BaseModel):
+    title: str
+    description: str
+    audience: str
+    problemStatements: list[str]
+    tags: list[str]
+    followUpQuestions: list[str]
+    burningProblems: list[str]
 
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-            text = page.extract_text() or ""
-            full_text.append(text)
+@st.cache_resource
+def get_anthropic_client():
+    """Initialize Anthropic client using Streamlit secrets"""
+    try:
+        api_key = st.secrets["anthropic"]["api_key"]
+        return anthropic.Anthropic(api_key=api_key)
+    except Exception as e:
+        st.error(f"Failed to initialize Anthropic client: {str(e)}")
+        return None
 
-            for word in words:
-                if float(word.get("size", 0)) >= 16 or "bold" in word.get("fontname", "").lower():
-                    highlights.append(word["text"])
-
-    return "\n".join(full_text), "\n".join(set(highlights))
-
-
-def clean_text(text: str, max_len: int = 4000) -> str:
-    return text.strip().replace("\n", " ")[:max_len]
-
-
-# ---------- Modified Prompt Builder ----------
-def build_prompt(typed_text: str, extracted_text: str, highlighted_text: str, founder_goal: str) -> str:
+def build_prompt(typed_text: str, founder_goal: str) -> str:
+    """
+    Modified prompt that emphasizes both the PDF content and founder goal
+    """
     return f"""
 You are an expert startup analyst. Analyze this startup comprehensively using the 10 Guard Rails framework, then generate targeted insights ONLY for genuine gaps.
 
 --- MATERIALS ---
-Pitch Deck: {clean_text(extracted_text)}
-Highlights: {highlighted_text}
 Founder Input: {typed_text}
-Assistance Goal: {founder_goal}
+CRITICAL - Assistance Goal: {founder_goal}
+Pitch Deck: Please analyze the uploaded PDF document thoroughly for all business details, metrics, strategies, and technical specifications.
+
+--- ABSOLUTE REQUIREMENTS ---
+1. THOROUGHLY analyze the uploaded PDF pitch deck - extract ALL business information, metrics, strategies, market data, technical details, financial projections, etc.
+2. MANDATORY: The founder specifically wants help with: "{founder_goal}" - This MUST be the primary focus of your analysis and recommendations
+3. Every follow-up question and burning problem MUST directly address this assistance goal: "{founder_goal}"
+4. If the founder goal is vague or unclear, ask specific clarifying questions about it
+5. Your entire analysis should be shaped by understanding what specific help they're seeking
 
 --- ANALYSIS FRAMEWORK: 10 GUARD RAILS ---
 1. VISION: Societal impact and long-term purpose
@@ -61,135 +65,96 @@ Assistance Goal: {founder_goal}
 10. LEGAL & REGULATORY: Compliance framework and IP protection
 
 --- MANDATORY ASSESSMENT PROCESS ---
-Before generating output, internally evaluate each guard rail:
+Before generating output, internally evaluate each guard rail based on BOTH the PDF content AND founder notes:
 
-✅ WELL-COVERED = Specific details, metrics, clear strategy provided
-❌ WEAK/MISSING = Vague mentions, no specifics, or completely absent
+✅ WELL-COVERED = Specific details, metrics, clear strategy provided in PDF or founder notes
+❌ WEAK/MISSING = Vague mentions, no specifics, or completely absent from both sources
 
-**RULE: Generate follow-ups and burning problems ONLY for ❌ WEAK/MISSING areas**
+**CRITICAL RULE: All follow-ups and burning problems must be filtered through the lens of their assistance goal: "{founder_goal}"**
 
-Examples of what NOT to ask if well-covered:
-- Don't ask "What's your revenue model?" if SaaS subscription is clearly stated
-- Don't ask "Who's your target market?" if specific industries/roles are mentioned
-- Don't ask "What's your tech stack?" if architecture is detailed
-
---- OUTPUT FORMAT (JSON) ---
+--- OUTPUT FORMAT (JSON ONLY) ---
 {{
-  "title": "Product name with unique positioning",
-  "description": "3-4 sentences using actual metrics and specifics from materials",
-  "audience": "Precise roles/segments mentioned in content",
-  "problemStatements": ["3 specific pain points with business impact"],
-  "tags": ["Industry/domain themes from content"],
-  "followUpQuestions": ["Exactly 3 analytical, context-rich questions (2-3 sentences each)"],
-  "burningProblems": ["Exactly 3 business risks from actual gaps identified"]
+  "title": "Product name with unique positioning from PDF/founder notes",
+  "description": "3-4 sentences using actual metrics and specifics from PDF and founder input",
+  "audience": "Precise roles/segments mentioned in PDF or founder notes",
+  "problemStatements": ["3 specific pain points with business impact from analysis"],
+  "tags": ["Industry/domain themes from PDF and founder content"],
+  "followUpQuestions": ["Exactly 3 strategic questions directly addressing: {founder_goal}"],
+  "burningProblems": ["Exactly 3 business risks from gaps, prioritized by relevance to: {founder_goal}"]
 }}
 
 --- FOLLOW-UP QUESTION REQUIREMENTS ---
 Each question must be:
+- **Directly related to their assistance goal**: "{founder_goal}"
 - **2-3 sentences long** with analytical depth
-- **Context-aware**: Reference specific details from their materials
-- **Strategic**: Address complex business challenges, not basic facts
-- **Sophisticated**: Show deep understanding of their industry/situation
+- **Context-aware**: Reference specific details from PDF and founder notes
+- **Strategic**: Address complex business challenges related to their requested help
+- **Sophisticated**: Show deep understanding of how their situation relates to their assistance needs
 
-AVOID: Simple, direct questions like "What is your target market?"
-PREFER: Complex, analytical questions like "Given your focus on X industry and the challenges of Y regulatory environment, how are you planning to navigate the inherent tension between rapid market entry and the extensive validation requirements that institutional buyers typically demand?"
+EXAMPLE: If founder goal is "fundraising help", questions should focus on investor concerns, valuation, traction metrics, etc.
+EXAMPLE: If founder goal is "product-market fit", questions should focus on customer validation, retention, usage patterns, etc.
+
+CRITICAL SUCCESS CRITERIA:
+- Anyone reading your output should immediately understand you've analyzed both the PDF content AND the founder's specific help request
+- Your recommendations must be laser-focused on their assistance goal: "{founder_goal}"
+- If you cannot determine how to help with their specific goal, ask clarifying questions about it
+
+Return ONLY valid JSON, no additional text or formatting.
 """
 
-
-# ---------- Claude (Anthropic) ----------
-def query_claude(prompt: str) -> str:
+def query_claude_with_pdf(client, prompt: str, pdf_content: bytes) -> str:
     """
-    Calls Claude 3.5 Haiku. Tries strict JSON mode; if the
-    installed SDK is too old for `format="json"`, it retries
-    without it and relies on the extractor.
+    Send PDF directly to Claude for analysis using the correct document format
     """
-    client = anthropic.Anthropic(api_key=st.secrets["anthropic"]["api_key"])
-    model_id = "claude-3-5-haiku-20241022"          # <-- correct ID
-
     try:
-        # Preferred path: SDK >= 0.21.0 supports `format="json"`
+        # Convert PDF to base64 for sending to Claude
+        pdf_base64 = base64.b64encode(pdf_content).decode('utf-8')
+        
         response = client.messages.create(
-            model=model_id,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
-            format="json",                          # <-- strict mode
+            model="claude-3-5-sonnet-20241022",  # Using Sonnet for PDF processing
+            messages=[
+                {
+                    "role": "user", 
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": pdf_base64
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            max_tokens=2000,
         )
-    except TypeError:
-        # Older SDK fallback (no `format` kwarg)
-        response = client.messages.create(
-            model=model_id,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
-        )
+        
+        return response.content[0].text if response.content else ""
+        
+    except Exception as e:
+        raise Exception(f"Error processing with Claude: {str(e)}")
 
-    # Anthropic returns a list of content blocks
-    return response.content[0].text if response.content else ""
-
-
-
-def query_nova_pro(prompt: str) -> str:
-    """
-    Nova Pro via AWS Bedrock – unchanged (already streams plain text).
-    """
-    body = {
-        "inferenceConfig": {"max_new_tokens": 1500, "temperature": 0.3},
-        "messages": [{"role": "user", "content": [{"text": prompt}]}],
-    }
-
-    response = bedrock.invoke_model_with_response_stream(
-        modelId=nova_inference_arn,
-        contentType="application/json",
-        accept="application/json",
-        body=json.dumps(body),
-    )
-
-    output_string = ""
-    for event in response["body"]:
-        if "chunk" in event:
-            chunk = event["chunk"]["bytes"]
-            if chunk:
-                try:
-                    payload = json.loads(chunk.decode("utf-8"))
-                    if "contentBlockDelta" in payload:
-                        output_string += payload["contentBlockDelta"]["delta"].get("text", "")
-                except Exception:
-                    continue
-    return output_string
-
-
-client = OpenAI(api_key=st.secrets["openai"]["api_key"])
-
-def query_gpt(prompt: str) -> str:
-    """
-    GPT‑4 Turbo with explicit JSON response_format.
-    """
-    response = client.chat.completions.create(
-        model="gpt-4-1106-preview",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=1500,
-        response_format={"type": "json_object"},  # <-- forces JSON
-    )
-    return response.choices[0].message.content
-
-
-# ---------- Robust JSON Extractor ----------
 def extract_json(raw: str) -> t.Optional[dict]:
     """
-    Best‑effort extraction when a model still slips extra prose or markdown fences.
+    Robust JSON extraction from Claude response
     """
     cleaned = raw.strip()
-
-    # Remove ```json … ``` or ``` … ``` fences if present
+    
+    # Remove markdown code fences if present
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z0-9]*\s*", "", cleaned)
         cleaned = re.sub(r"```$", "", cleaned).strip()
-
-    # First attempt direct parse
+    
+    # First attempt: direct parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Fallback: grab first {...} block
+        # Fallback: extract first JSON object
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if match:
             try:
@@ -198,46 +163,172 @@ def extract_json(raw: str) -> t.Optional[dict]:
                 pass
     return None
 
+def test_api_key(client):
+    """Test if the Anthropic API key is working"""
+    try:
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            messages=[{"role": "user", "content": "Hello, just testing the API key. Please respond with 'API working'."}],
+            max_tokens=50
+        )
+        return True, response.content[0].text if response.content else "No response"
+    except Exception as e:
+        return False, str(e)
 
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="Outlaw Idea Capture", layout="wide")
-st.title("📊 Outlaw Idea Capture AI")
-st.markdown("Upload your pitch deck and brief notes to extract structured business insights.")
+def main():
+    st.title("🚀 Outlaw Idea Capture")
+    st.markdown("### Analyze your startup using the 10 Guard Rails framework")
+    
+    # Initialize client
+    client = get_anthropic_client()
+    if not client:
+        st.error("Cannot proceed without valid Anthropic API key")
+        return
+    
+    # Sidebar for API key testing
+    with st.sidebar:
+        st.header("System Status")
+        if st.button("Test API Key"):
+            with st.spinner("Testing API connection..."):
+                is_valid, message = test_api_key(client)
+                if is_valid:
+                    st.success(f"✅ API Key Valid: {message}")
+                else:
+                    st.error(f"❌ API Key Invalid: {message}")
+        
+        st.markdown("---")
+        st.markdown("**Version:** 1.0.0")
+        st.markdown("**Framework:** 10 Guard Rails")
+    
+    # Main form
+    with st.form("startup_analysis_form"):
+        st.subheader("📝 Founder Information")
+        
+        # Founder notes input
+        founder_notes = st.text_area(
+            "Founder Notes & Product Description",
+            placeholder="Describe your startup, product, vision, and any key details...",
+            height=150,
+            help="Provide detailed information about your startup, product, and current status"
+        )
+        
+        # Founder goal input
+        founder_goal = st.text_area(
+            "What specific help do you want from Outlaw?",
+            placeholder="e.g., fundraising strategy, product-market fit validation, go-to-market planning...",
+            height=100,
+            help="Be specific about the type of assistance you're seeking"
+        )
+        
+        st.subheader("📄 Pitch Deck Upload")
+        
+        # File upload
+        pitch_deck = st.file_uploader(
+            "Upload your pitch deck (PDF only)",
+            type=['pdf'],
+            help="Upload your startup pitch deck for comprehensive analysis"
+        )
+        
+        # Submit button
+        submitted = st.form_submit_button("🔍 Analyze Startup", use_container_width=True)
+    
+    # Process form submission
+    if submitted:
+        # Validation
+        errors = []
+        if not founder_notes.strip():
+            errors.append("Founder notes cannot be empty")
+        if not founder_goal.strip():
+            errors.append("Founder goal cannot be empty")
+        if not pitch_deck:
+            errors.append("Please upload a PDF pitch deck")
+        
+        if errors:
+            for error in errors:
+                st.error(error)
+            return
+        
+        # Process the analysis
+        try:
+            with st.spinner("🤖 Analyzing your startup with Claude AI..."):
+                # Read PDF content
+                pdf_content = pitch_deck.read()
+                
+                if len(pdf_content) == 0:
+                    st.error("PDF file is empty")
+                    return
+                
+                # Build prompt
+                prompt = build_prompt(founder_notes, founder_goal)
+                
+                # Query Claude
+                raw_output = query_claude_with_pdf(client, prompt, pdf_content)
+                
+                # Parse JSON response
+                parsed_result = extract_json(raw_output)
+                
+                if parsed_result:
+                    st.success("✅ Analysis completed successfully!")
+                    display_results(parsed_result)
+                else:
+                    st.warning("⚠️ Could not parse structured output")
+                    st.subheader("Raw Output")
+                    st.text_area("Raw Claude Response", raw_output, height=300)
+                    
+        except Exception as e:
+            st.error(f"❌ Error during analysis: {str(e)}")
 
-typed_input = st.text_area("📝 Enter Founder Notes / Product Description", height=200)
-founder_goal = st.text_area("🎯 What help do you want from Outlaw?", height=100)
-uploaded_file = st.file_uploader("📎 Upload Pitch Deck (PDF)", type=["pdf"])
-model_choice = st.selectbox(
-    "🤖 Choose Model",
-    ["Nova Pro (AWS)", "Claude 3.5 Haiku (Anthropic)", "GPT-4 Turbo (OpenAI)"],
-    index=0,
-)
+def display_results(data: dict):
+    """Display the analysis results in a structured format"""
+    
+    # Title and Description
+    st.header(f"📊 Analysis: {data.get('title', 'Unknown')}")
+    st.markdown(f"**Description:** {data.get('description', 'No description available')}")
+    
+    # Create columns for better layout
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Audience
+        st.subheader("🎯 Target Audience")
+        st.write(data.get('audience', 'Not specified'))
+        
+        # Problem Statements
+        st.subheader("❗ Problem Statements")
+        problems = data.get('problemStatements', [])
+        for i, problem in enumerate(problems, 1):
+            st.write(f"{i}. {problem}")
+        
+        # Tags
+        st.subheader("🏷️ Tags")
+        tags = data.get('tags', [])
+        if tags:
+            st.write(" • ".join(tags))
+        else:
+            st.write("No tags available")
+    
+    with col2:
+        # Follow-up Questions
+        st.subheader("❓ Strategic Follow-up Questions")
+        questions = data.get('followUpQuestions', [])
+        for i, question in enumerate(questions, 1):
+            st.write(f"{i}. {question}")
+        
+        # Burning Problems
+        st.subheader("🔥 Critical Business Risks")
+        burning_problems = data.get('burningProblems', [])
+        for i, problem in enumerate(burning_problems, 1):
+            st.write(f"{i}. {problem}")
+    
+    # Download results as JSON
+    st.subheader("📥 Export Results")
+    json_str = json.dumps(data, indent=2)
+    st.download_button(
+        label="Download Analysis as JSON",
+        data=json_str,
+        file_name=f"startup_analysis_{data.get('title', 'unknown').replace(' ', '_').lower()}.json",
+        mime="application/json"
+    )
 
-if st.button("🔍 Analyze"):
-    if not uploaded_file or not typed_input or not founder_goal:
-        st.error("Please provide founder notes, a pitch deck, and a goal.")
-    else:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded_file.read())
-            file_path = tmp.name
-
-        with st.spinner("Extracting insights..."):
-            extracted_text, highlighted = extract_pdf_text(file_path)
-            prompt = build_prompt(typed_input, extracted_text, highlighted, founder_goal)
-
-            if model_choice == "Nova Pro (AWS)":
-                raw_output = query_nova_pro(prompt)
-            elif model_choice == "Claude 3.5 Haiku (Anthropic)":
-                raw_output = query_claude(prompt)
-            else:
-                raw_output = query_gpt(prompt)
-
-            parsed = extract_json(raw_output)
-            if parsed is not None:
-                st.success("✅ Insights generated successfully.")
-                st.json(parsed)
-            else:
-                st.warning("⚠️ Output could not be parsed as JSON. Showing raw output below.")
-                st.code(raw_output)
-
-        os.remove(file_path)
+if __name__ == "__main__":
+    main()
